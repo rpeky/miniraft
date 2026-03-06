@@ -11,17 +11,6 @@ import (
 	//"net"
 )
 
-// server states
-// https://go.dev/ref/spec#Iota
-type ServerState int
-
-const (
-	Candidate ServerState = iota
-	Follower
-	Leader
-	Failed
-)
-
 /* --------------- Find file and consume data --------------------*/
 func fileParse(path string) ([]string, error) {
 	file, err := os.Open(path)
@@ -103,6 +92,47 @@ type RequestVoteRequest struct {
 type RequestVoteResponse struct {
 	Term        int
 	VoteGranted bool
+}
+
+type ServerState int
+
+const (
+	Candidate ServerState = iota
+	Follower
+	Leader
+	Failed
+)
+
+// https://raft.github.io/raft.pdf
+type PersistentState struct {
+	currentTerm int
+	votedFor    string
+	log         []LogEntry
+}
+
+type VolatileState struct {
+	commitIndex int
+	lastApplied int
+}
+
+type VolatileStateLeader struct {
+	nextIndex  int
+	matchIndex int
+}
+
+func (p *PersistentState) initialisePState() {
+	p.currentTerm = 0
+	p.votedFor = ""
+}
+
+func (v *VolatileState) initialiseVState() {
+	v.commitIndex = 0
+	v.lastApplied = 0
+}
+
+func (vl *VolatileStateLeader) initialiseVVState(lastLog int) {
+	vl.nextIndex = lastLog
+	vl.matchIndex = 0
 }
 
 func main() {
