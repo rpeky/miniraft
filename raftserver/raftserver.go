@@ -4,7 +4,6 @@ import (
 	//	"encoding/json"
 	"bufio"
 	"fmt"
-	"log"
 	"os"
 	"slices"
 	"strings"
@@ -30,31 +29,22 @@ func fileParse(path string) ([]string, error) {
 }
 
 func validateServer(identity string, hosts []string) bool {
-	/*
-		host, port, err := net.SplitHostPort(identity)
-		if err!=nil{
-			return err
-		}
-	*/
-
 	return slices.Contains(hosts, identity)
-
-	// return nil
 }
 
 /* --------------- Logging --------------------*/
 
+// just in case server-host-port.log meant host and port were placeholder names LOL
+// will be some x.x.x.x:yyyyy format | only have to swap the : with a -
 // https://www.golinuxcloud.com/golang-log-to-file/
-func logging(logcommand string) {
-	fileName := "server-host-port.log"
+func constructLogFile(id string) (*os.File, error) {
+	parsedName := strings.ReplaceAll(id, ":", "-")
+	fileName := "server-" + parsedName + ".log"
 	logFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		log.Panic(err)
+		return nil, err
 	}
-	defer logFile.Close()
-
-	log.SetOutput(logFile)
-	log.Println(logcommand)
+	return logFile, nil
 }
 
 type LogEntry struct {
@@ -63,9 +53,9 @@ type LogEntry struct {
 	CommandName string
 }
 
-func formatLogging(logdata LogEntry) {
-	output := fmt.Sprintf("%d,%d,%s", logdata.Term, logdata.Index, logdata.CommandName)
-	logging(output)
+func (sm *ServerSM) formatLogging(logdata LogEntry) error {
+	_, writeErr := fmt.Fprintf(sm.logFile, "%d,%d,%s\n", logdata.Term, logdata.Index, logdata.CommandName)
+	return writeErr
 }
 
 type AppendEntriesRequest struct {
@@ -73,7 +63,7 @@ type AppendEntriesRequest struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
-	LeaderId     string
+	LeaderID     string
 	LogEntries   []LogEntry
 }
 
@@ -83,10 +73,10 @@ type AppendEntriesResponse struct {
 }
 
 type RequestVoteRequest struct {
-	Term         int
-	LastLogIndex int
-	LastLogTerm  int
-	CommandName  string
+	Term          int
+	LastLogIndex  int
+	LastLogTerm   int
+	CandidateName string
 }
 
 type RequestVoteResponse struct {
@@ -97,8 +87,8 @@ type RequestVoteResponse struct {
 type ServerState int
 
 const (
-	Candidate ServerState = iota
-	Follower
+	Follower ServerState = iota
+	Candidate
 	Leader
 	Failed
 )
@@ -116,8 +106,8 @@ type VolatileState struct {
 }
 
 type VolatileStateLeader struct {
-	nextIndex  int
-	matchIndex int
+	nextIndex  map[string]int
+	matchIndex map[string]int
 }
 
 func (p *PersistentState) initialisePState() {
@@ -130,18 +120,118 @@ func (v *VolatileState) initialiseVState() {
 	v.lastApplied = 0
 }
 
-func (vl *VolatileStateLeader) initialiseVVState(lastLog int) {
-	vl.nextIndex = lastLog
-	vl.matchIndex = 0
+func (vl *VolatileStateLeader) initialiseVVState(lastLog int, peers []string) {
+	vl.nextIndex = make(map[string]int)
+	vl.matchIndex = make(map[string]int)
+
+	for _, peer := range peers {
+		vl.nextIndex[peer] = lastLog + 1
+		vl.matchIndex[peer] = 0
+	}
 }
 
-func main() {
-	/*
-		if len(os.Args) < 3 {
-			fmt.Println("check num args")
-			return
+// consolidate the states/funcs of the state machine
+type ServerSM struct {
+	// server role
+	state ServerState
+
+	// state management stuff
+	identity string
+	leaderID string
+	peers    []string
+
+	pstate PersistentState
+	vstate VolatileState
+
+	// leader stuff
+	nextIndex  map[string]int
+	matchIndex map[string]int
+
+	logFile *os.File
+}
+
+func generatePeers(identity string, hostlist []string) []string {
+	peers := make([]string, 0, len(hostlist)-1)
+	for _, h := range hostlist {
+		if h != identity {
+			peers = append(peers, h)
 		}
-	*/
+	}
+	return peers
+}
+
+func initialiseSM(identity string, hostlist []string) (*ServerSM, error) {
+	// validate identity
+	if !validateServer(identity, hostlist) {
+		fmt.Println("Server identity not in hostlist")
+		return nil, fmt.Errorf("%s is not in hostlist", identity)
+	}
+
+	// create log file
+	logFile, lfErr := constructLogFile(identity)
+	if lfErr != nil {
+		fmt.Println("Failed to construct log file")
+		return nil, fmt.Errorf("FATAL | Failed to construct Log File: %w", lfErr)
+	}
+
+	// generate peer list
+	peerlist := generatePeers(identity, hostlist)
+
+	s := &ServerSM{
+		// always start as follower
+		state: Follower,
+
+		identity: identity,
+		leaderID: "",
+		peers:    peerlist,
+
+		pstate: PersistentState{
+			currentTerm: 0,
+			votedFor:    "",
+			log:         make([]LogEntry, 0),
+		},
+		vstate: VolatileState{
+			commitIndex: 0,
+			lastApplied: 0,
+		},
+
+		nextIndex:  make(map[string]int),
+		matchIndex: make(map[string]int),
+
+		logFile: logFile,
+	}
+
+	return s, nil
+}
+
+func (sm *ServerSM) printLog() {
+	fmt.Println("plaeholder log test")
+	sample := LogEntry{
+		Index:       0,
+		Term:        1,
+		CommandName: "test",
+	}
+	sm.formatLogging(sample)
+}
+
+func (sm *ServerSM) printStates() {
+	fmt.Printf("identity: %s\n", sm.identity)
+	fmt.Printf("state: %d\n", sm.state)
+	fmt.Println("\t0 - Follower")
+	fmt.Println("\t1 - Candidate")
+	fmt.Println("\t2 - Leader")
+	fmt.Println("\t3 - Failed")
+	fmt.Printf("leaderID: %s\n", sm.leaderID)
+	fmt.Printf("peers: %v\n", sm.state)
+	fmt.Printf("current term: %d\n", sm.pstate.currentTerm)
+	fmt.Printf("voted for: %s\n", sm.pstate.votedFor)
+	fmt.Printf("commit index: %d\n", sm.vstate.commitIndex)
+	fmt.Printf("last applied: %d\n", sm.vstate.lastApplied)
+	fmt.Printf("log size: %d\n", len(sm.pstate.log))
+}
+
+/*--------------------main-------------------------*/
+func main() {
 
 	if len(os.Args) != 3 {
 		fmt.Fprintln(os.Stderr, "expect two arguments -> go run raftserver.go server-host:server-port filename")
@@ -155,14 +245,19 @@ func main() {
 
 	hostlist, hostreadErr := fileParse(path)
 	if hostreadErr != nil {
-		fmt.Println("file error:", hostreadErr)
-		return
+		fmt.Println("FATAL | file error:", hostreadErr)
+		os.Exit(-1)
 	}
-	// sancheck := validateServer(identity, hostlist)
-	if !validateServer(identity, hostlist) {
-		fmt.Println("Server identity not in hostlist")
-		return
+
+	// initialise the server
+	server, iniErr := initialiseSM(identity, hostlist)
+	if iniErr != nil {
+		fmt.Fprintln(os.Stderr, "server initialisation setup failed:", iniErr)
+		os.Exit(-1)
 	}
+
+	// eventually close the log file
+	defer server.logFile.Close()
 
 	// loop and wait for user inputs (Reference: minichord.pdf)
 	reader := bufio.NewReader(os.Stdin)
@@ -184,13 +279,24 @@ func main() {
 		switch tok[0] {
 
 		case "log":
-			os.Exit(1)
+			server.printLog()
+
 		case "print":
-			os.Exit(1)
+			server.printStates()
+
 		case "resume":
-			os.Exit(1)
+			// default behaviour is to be a follower, reset leader, wait to vote
+			server.state = Follower
+			server.leaderID = ""
+			fmt.Printf("server %s resuming, wait for next vote to do stuff\n", server.identity)
+
 		case "suspend":
-			os.Exit(1)
+			server.state = Failed
+			fmt.Printf("suspended server %s\n", server.identity)
+
+		case "q":
+			server.printStates()
+			return
 
 		default:
 			fmt.Printf("Command not understood: %s\n", cmd)
