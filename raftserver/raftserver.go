@@ -1,13 +1,16 @@
 package main
 
 import (
-	//	"encoding/json"
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"slices"
 	"strings"
+	"time"
 	//"net"
+	"sync"
 )
 
 /* --------------- Find file and consume data --------------------*/
@@ -58,12 +61,89 @@ func (sm *ServerSM) formatLogging(logdata LogEntry) error {
 	return writeErr
 }
 
+/* --------------- Message Handling --------------------*/
+type MessageType int
+
+const (
+	AppendEntriesRequestMessage MessageType = iota
+	AppendEntriesResponseMessage
+	RequestVoteRequestMessage
+	RequestVoteResponseMessage
+)
+
+type RaftMessage struct {
+	Message any
+}
+
+func (message *RaftMessage) MarshalJson() (result []byte, err error) {
+	result, err = json.Marshal(message.Message)
+	return
+}
+
+func (message *RaftMessage) UnmarshalJSON(b []byte) (msg MessageType, err error) {
+	aer := &AppendEntriesRequest{}
+	err = json.Unmarshal(b, aer)
+	if err == nil && aer.LeaderId != "" {
+		msg = AppendEntriesRequestMessage
+		message.Message = aer
+		return
+	}
+	if _, ok := err.(*json.UnmarshalTypeError); err != nil && !ok {
+		return
+	}
+
+	aeres := &AppendEntriesResponse{}
+	if err = json.Unmarshal(b, aeres); err != nil {
+		return
+	}
+	if aeres.Term > 0 {
+		msg = AppendEntriesResponseMessage
+		message.Message = aeres
+		return
+	}
+
+	rvr := &RequestVoteRequest{}
+	if err = json.Unmarshal(b, rvr); err != nil {
+		return
+	}
+	if rvr.Term > 0 {
+		msg = RequestVoteRequestMessage
+		message.Message = rvr
+		return
+	}
+
+	rvres := &RequestVoteResponse{}
+	if err = json.Unmarshal(b, rvres); err != nil {
+		return
+	}
+	if rvres.Term > 0 {
+		msg = RequestVoteResponseMessage
+		message.Message = rvres
+	}
+	return
+}
+
+func DropStaleResponse() {
+}
+
+func Receive() {
+}
+
+func DuplicateMessage() {
+}
+
+func DropMessage() {
+}
+
+/* --------------- Raft operations --------------------*/
+// https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf
+
 type AppendEntriesRequest struct {
 	Term         int
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
-	LeaderID     string
+	LeaderId     string
 	LogEntries   []LogEntry
 }
 
@@ -71,6 +151,20 @@ type AppendEntriesResponse struct {
 	Term    int
 	Success bool
 }
+
+func AppendEntries() {
+}
+
+func ClientRequest() {
+}
+
+func HandleAppendEntriesRequest() {
+}
+
+func HandleAppendEntriesResponse() {
+}
+
+/* --------------- Voting mechanism --------------------*/
 
 type RequestVoteRequest struct {
 	Term          int
@@ -83,6 +177,52 @@ type RequestVoteResponse struct {
 	Term        int
 	VoteGranted bool
 }
+
+// somewhere between 150-300ms fixed interval
+func RandomTimeoutValue() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+}
+
+func (sm *ServerSM) SetElectionTimeout() {
+	sm.timeoutDuration = RandomTimeoutValue()
+	sm.latestHeartbeat = time.Now()
+}
+
+func (sm *ServerSM) Timeout() {
+	if sm.state == Failed {
+		return
+	}
+
+	if sm.state == Leader {
+		return
+	}
+
+	// check heartbeat if action requried
+	inbetween := time.Since(sm.latestHeartbeat)
+	if inbetween < sm.timeoutDuration {
+		return
+	}
+
+	// expired
+
+}
+
+func UpdateTerm() {
+}
+
+func RequestVote() {
+}
+
+func BecomeLeader() {
+}
+
+func HandleRequestVoteRequest() {
+}
+
+func HandleRequestVoteResponse() {
+}
+
+/* --------------- State Machine Mechanisms --------------------*/
 
 type ServerState int
 
@@ -143,11 +283,18 @@ type ServerSM struct {
 	pstate PersistentState
 	vstate VolatileState
 
+	// voting mechanism
+	timeoutDuration time.Duration
+	latestHeartbeat time.Time
+
 	// leader stuff
 	nextIndex  map[string]int
 	matchIndex map[string]int
 
 	logFile *os.File
+
+	// lock shared stuff
+	mu sync.Mutex
 }
 
 func generatePeers(identity string, hostlist []string) []string {
@@ -229,6 +376,8 @@ func (sm *ServerSM) printStates() {
 	fmt.Printf("last applied: %d\n", sm.vstate.lastApplied)
 	fmt.Printf("log size: %d\n", len(sm.pstate.log))
 }
+
+/*--------------------State Transitions-------------------------*/
 
 /*--------------------main-------------------------*/
 func main() {
