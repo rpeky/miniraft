@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+
 	//"net"
 	"sync"
 )
@@ -158,7 +159,75 @@ func AppendEntries() {
 func ClientRequest() {
 }
 
-func HandleAppendEntriesRequest() {
+func (sm *ServerSM) checkTerm(index int) int {
+	if index == 0 {
+		return 0
+	}
+	return sm.pstate.log[index-1].Term
+}
+
+func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest) AppendEntriesResponse {
+	// lock the rw
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	resp := AppendEntriesResponse{
+		sm.pstate.currentTerm,
+		false,
+	}
+
+	// mismatch term 5.1
+	if RequestData.Term < sm.pstate.currentTerm {
+		return resp
+	}
+
+	// log does not have prevLogIndex 5.2
+	if RequestData.PrevLogIndex > len(sm.pstate.log) {
+		return resp
+	}
+
+	if RequestData.PrevLogIndex > 0 && sm.checkTerm(req.PrevLogIndex) != RequestData.PrevLogTerm {
+		return resp
+	}
+
+	// check conflict with existing
+	// position to start adding logs
+	indexPos := RequestData.PrevLogIndex + 1
+
+	for i, entry := range RequestData.LogEntries {
+		target := i + indexPos
+		sliceidx := target - 1
+
+		// if entries already exist
+		if target <= len(sm.pstate.log) {
+			// delete this and all after if conflict 5.3
+			// then add entries not in log in one go, no need to
+			// iterate (AppendEntries RPC receiver step 4)
+			if sm.pstate.log[sliceidx].Term != entry.Term {
+				sm.pstate.log = sm.pstate.log[:sliceidx]
+				sm.pstate.log = append(sm.pstate.log, RequestData.LogEntries[i:]...)
+				break
+			}
+
+			// nothing else to do, index is caught up
+			continue
+		}
+
+		// append anything else
+		sm.pstate.log = append(sm.pstate.log, RequestData.LogEntries[i:]...)
+		break
+	}
+
+	// AppendEntries RPC receiver step 5
+	if RequestData.LeaderCommit > sm.vstate.commitIndex {
+		// set commit index to the min
+		sm.vstate.commitIndex = min(RequestData.LeaderCommit, len(sm.pstate.log))
+	}
+
+	// change to true to return
+	resp.Success = true
+
+	return resp
 }
 
 func HandleAppendEntriesResponse() {
@@ -251,13 +320,13 @@ type VolatileStateLeader struct {
 }
 
 func (p *PersistentState) initialisePState() {
-	p.currentTerm = 0
+	p.currentTerm = -1
 	p.votedFor = ""
 }
 
 func (v *VolatileState) initialiseVState() {
-	v.commitIndex = 0
-	v.lastApplied = 0
+	v.commitIndex = -1
+	v.lastApplied = -1
 }
 
 func (vl *VolatileStateLeader) initialiseVVState(lastLog int, peers []string) {
@@ -282,14 +351,11 @@ type ServerSM struct {
 
 	pstate PersistentState
 	vstate VolatileState
+	lstate VolatileStateLeader
 
 	// voting mechanism
 	timeoutDuration time.Duration
 	latestHeartbeat time.Time
-
-	// leader stuff
-	nextIndex  map[string]int
-	matchIndex map[string]int
 
 	logFile *os.File
 
@@ -369,7 +435,7 @@ func (sm *ServerSM) printStates() {
 	fmt.Println("\t2 - Leader")
 	fmt.Println("\t3 - Failed")
 	fmt.Printf("leaderID: %s\n", sm.leaderID)
-	fmt.Printf("peers: %v\n", sm.state)
+	fmt.Printf("peers: %v\n", sm.peers)
 	fmt.Printf("current term: %d\n", sm.pstate.currentTerm)
 	fmt.Printf("voted for: %s\n", sm.pstate.votedFor)
 	fmt.Printf("commit index: %d\n", sm.vstate.commitIndex)
