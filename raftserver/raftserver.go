@@ -186,7 +186,7 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 		return resp
 	}
 
-	if RequestData.PrevLogIndex > 0 && sm.checkTerm(req.PrevLogIndex) != RequestData.PrevLogTerm {
+	if RequestData.PrevLogIndex > 0 && sm.checkTerm(RequestData.PrevLogIndex) != RequestData.PrevLogTerm {
 		return resp
 	}
 
@@ -408,8 +408,10 @@ func initialiseSM(identity string, hostlist []string) (*ServerSM, error) {
 			lastApplied: 0,
 		},
 
-		nextIndex:  make(map[string]int),
-		matchIndex: make(map[string]int),
+		lstate: VolatileStateLeader{
+			nextIndex:  make(map[string]int),
+			matchIndex: make(map[string]int),
+		},
 
 		logFile: logFile,
 	}
