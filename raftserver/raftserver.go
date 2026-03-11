@@ -71,6 +71,7 @@ const (
 	AppendEntriesResponseMessage
 	RequestVoteRequestMessage
 	RequestVoteResponseMessage
+	ClientCommandMessage
 )
 
 type RaftMessage struct {
@@ -83,6 +84,15 @@ func (message *RaftMessage) MarshalJson() (result []byte, err error) {
 }
 
 func (message *RaftMessage) UnmarshalJSON(b []byte) (msg MessageType, err error) {
+	var clientMap map[string]string
+	err = json.Unmarshal(b, &clientMap)
+	if err == nil {
+		if value, ok := clientMap["Command"]; ok && value != "" {
+			message.Message = value
+			return ClientCommandMessage, nil
+		}
+	}
+
 	aer := &AppendEntriesRequest{}
 	err = json.Unmarshal(b, aer)
 	if err == nil && aer.LeaderId != "" {
@@ -149,9 +159,10 @@ func (sm *ServerSM) Send(response any, target string) {
 // Recieve messages from client / other servers
 func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
 	var rm RaftMessage
-	msgType, err := rm.UnmarshalJSON(data)
+	msgType, _ := rm.UnmarshalJSON(data)
 
-	if err != nil { // unrecognised message == client command
+	switch msgType {
+	case ClientCommandMessage:
 		switch sm.state {
 		case Leader: // if leader, append to logs and alert all clients about this log
 			sm.mu.Lock()
@@ -164,8 +175,6 @@ func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
 			// append to own entry
 			sm.pstate.log = append(sm.pstate.log, newMessage)
 			sm.mu.Unlock()
-
-			// TODO: respond to client
 
 			// Get data from current sm
 			sm.mu.Lock()
@@ -200,6 +209,7 @@ func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
 
 					sm.Send(request, peer)
 				}
+
 			}
 		case Candidate: // either buffer these commands and process them after the election concludes, or drop them
 			DropMessage()
@@ -222,9 +232,6 @@ func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
 				DropMessage()
 			}
 		}
-	}
-
-	switch msgType {
 	case AppendEntriesRequestMessage:
 		req := rm.Message.(*AppendEntriesRequest)
 		response := sm.HandleAppendEntriesRequest(req)
