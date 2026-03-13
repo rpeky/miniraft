@@ -153,6 +153,8 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
+// used by leader to replicate log entries
+// also meant to be a heartbeat
 func AppendEntries() {
 }
 
@@ -230,7 +232,22 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 	return resp
 }
 
-func HandleAppendEntriesResponse() {
+func (sm *ServerSM) HandleAppendEntriesResponse(resp AppendEntriesResponse) {
+	// stale message
+	if sm.pstate.currentTerm > resp.Term {
+		return
+	}
+
+	// check response, update if smaller
+	if sm.pstate.currentTerm < resp.Term {
+		sm.pstate.currentTerm = resp.Term
+
+		// demote to follower if term is out of date
+		if sm.state == Candidate || sm.state == Leader {
+			sm.state = Follower
+		}
+	}
+
 }
 
 /* --------------- Voting mechanism --------------------*/
@@ -258,11 +275,7 @@ func (sm *ServerSM) SetElectionTimeout() {
 }
 
 func (sm *ServerSM) Timeout() {
-	if sm.state == Failed {
-		return
-	}
-
-	if sm.state == Leader {
+	if sm.state == Failed || sm.state == Leader {
 		return
 	}
 
@@ -277,15 +290,44 @@ func (sm *ServerSM) Timeout() {
 }
 
 func UpdateTerm() {
+
+}
+
+func checkLog(lastIdx int, lastTerm int, rlog LogEntry) bool {
+	evalIndex := lastIdx >= rlog.Index
+	evalTerm := lastTerm >= rlog.Term
+	return evalIndex && evalTerm
 }
 
 func RequestVote() {
+
 }
 
-func BecomeLeader() {
+func (sm *ServerSM) BecomeLeader() {
+	if sm.state != Candidate {
+		return
+	}
+
+	sm.state = Leader
 }
 
-func HandleRequestVoteRequest() {
+func (sm *ServerSM) HandleRequestVoteRequest(req RequestVoteRequest) RequestVoteResponse {
+	resp := RequestVoteResponse{
+		sm.pstate.currentTerm,
+		false,
+	}
+
+	// 5.1 return false if term < currentTerm
+	if req.Term < sm.pstate.currentTerm {
+		return resp
+	}
+
+	if (sm.pstate.votedFor == "" || sm.pstate.votedFor == req.CandidateName) && checkLog(req.LastLogIndex, req.LastLogTerm, sm.pstate.log[len(sm.pstate.log)-1]) {
+		resp.VoteGranted = true
+		return resp
+	}
+
+	return resp
 }
 
 func HandleRequestVoteResponse() {
@@ -320,13 +362,13 @@ type VolatileStateLeader struct {
 }
 
 func (p *PersistentState) initialisePState() {
-	p.currentTerm = -1
+	p.currentTerm = 0
 	p.votedFor = ""
 }
 
 func (v *VolatileState) initialiseVState() {
-	v.commitIndex = -1
-	v.lastApplied = -1
+	v.commitIndex = 0
+	v.lastApplied = 0
 }
 
 func (vl *VolatileStateLeader) initialiseVVState(lastLog int, peers []string) {
