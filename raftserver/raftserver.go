@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	//"net"
+	"log"
+	"net"
 	"sync"
 )
 
@@ -70,6 +71,7 @@ const (
 	AppendEntriesResponseMessage
 	RequestVoteRequestMessage
 	RequestVoteResponseMessage
+	ClientCommandMessage
 )
 
 type RaftMessage struct {
@@ -82,6 +84,15 @@ func (message *RaftMessage) MarshalJson() (result []byte, err error) {
 }
 
 func (message *RaftMessage) UnmarshalJSON(b []byte) (msg MessageType, err error) {
+	var clientMap map[string]string
+	err = json.Unmarshal(b, &clientMap)
+	if err == nil {
+		if value, ok := clientMap["Command"]; ok && value != "" {
+			message.Message = value
+			return ClientCommandMessage, nil
+		}
+	}
+
 	aer := &AppendEntriesRequest{}
 	err = json.Unmarshal(b, aer)
 	if err == nil && aer.LeaderId != "" {
@@ -127,7 +138,114 @@ func (message *RaftMessage) UnmarshalJSON(b []byte) (msg MessageType, err error)
 func DropStaleResponse() {
 }
 
-func Receive() {
+// Send messages to other servers only
+func (sm *ServerSM) Send(response any, target string) {
+	rm := RaftMessage{Message: response}
+	data, _ := rm.MarshalJson()
+
+	udpAddress, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddress)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.Write(data)
+}
+
+// Recieve messages from client / other servers
+func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
+	var rm RaftMessage
+	msgType, _ := rm.UnmarshalJSON(data)
+
+	switch msgType {
+	case ClientCommandMessage:
+		switch sm.state {
+		case Leader: // if leader, append to logs and alert all clients about this log
+			sm.mu.Lock()
+			newMessage := LogEntry{ // create log entry
+				Index:       len(sm.pstate.log) + 1,
+				Term:        sm.pstate.currentTerm,
+				CommandName: string(data),
+			}
+
+			// append to own entry
+			sm.pstate.log = append(sm.pstate.log, newMessage)
+			sm.mu.Unlock()
+
+			// Get data from current sm
+			sm.mu.Lock()
+			logs := sm.pstate.log
+			currentTerm := sm.pstate.currentTerm
+			commitIndex := sm.vstate.commitIndex
+			sm.mu.Unlock()
+
+			for _, peer := range sm.peers {
+				nextIndex := sm.lstate.nextIndex[peer]
+
+				if len(logs) >= nextIndex {
+					prevLogIndex := nextIndex - 1
+					prevLogTerm := 0
+					if prevLogIndex > 0 {
+						prevLogTerm = logs[prevLogIndex-1].Term
+					}
+
+					// Slice updated entries
+					entriesToSend := make([]LogEntry, len(logs[nextIndex-1:]))
+					copy(entriesToSend, logs[nextIndex-1:])
+
+					// Create Request
+					request := AppendEntriesRequest{
+						Term:         currentTerm,
+						LeaderId:     sm.identity,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						LogEntries:   entriesToSend,
+						LeaderCommit: commitIndex,
+					}
+
+					sm.Send(request, peer)
+				}
+
+			}
+		case Candidate: // either buffer these commands and process them after the election concludes, or drop them
+			DropMessage()
+		default: // if not leader, dont append anything and forward it to the leader (for both follower and failed)
+			sm.mu.Lock()
+			leaderID := sm.leaderID
+			sm.mu.Unlock()
+
+			if leaderID != "" {
+				leaderAddress, err := net.ResolveUDPAddr("udp", sm.leaderID)
+				if err != nil {
+					log.Fatalf("Failed to resolve: %v", err)
+				}
+
+				conn, _ := net.DialUDP("udp", nil, leaderAddress)
+				defer conn.Close()
+				conn.Write(data)
+			} else {
+				fmt.Println("Command received but leader is unknown so we will drop the message.")
+				DropMessage()
+			}
+		}
+	case AppendEntriesRequestMessage:
+		req := rm.Message.(*AppendEntriesRequest)
+		response := sm.HandleAppendEntriesRequest(req)
+		sm.Send(response, senderAddress.String())
+	case AppendEntriesResponseMessage:
+		resp := rm.Message.(*AppendEntriesResponse)
+		sm.HandleAppendEntriesResponse(resp)
+	case RequestVoteRequestMessage:
+		break
+	case RequestVoteResponseMessage:
+		break
+	default:
+		break
+	}
 }
 
 func DuplicateMessage() {
@@ -231,6 +349,7 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 
 	return resp
 }
+
 
 func (sm *ServerSM) HandleAppendEntriesResponse(resp AppendEntriesResponse) {
 	// stale message
@@ -517,6 +636,33 @@ func main() {
 
 	// eventually close the log file
 	defer server.logFile.Close()
+
+	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
+	// Reference: miniraft.pdf
+	go func() {
+		addr, err := net.ResolveUDPAddr("udp", server.identity)
+		if err != nil {
+			log.Fatalf("Failed to resolve: %v", err)
+		}
+
+		listener, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			log.Fatalf("Failed to listen: %v", err)
+		}
+
+		for {
+			buf := make([]byte, 65536)
+
+			n, remoteAddress, err := listener.ReadFromUDP(buf)
+			if err != nil {
+				fmt.Printf("UDP read error: %v\n", err)
+				continue
+			}
+
+			// Use another goroutine in case there is a slow request, so we can continue listening for messages
+			go server.Receive(buf[:n], remoteAddress)
+		}
+	}()
 
 	// loop and wait for user inputs (Reference: minichord.pdf)
 	reader := bufio.NewReader(os.Stdin)
