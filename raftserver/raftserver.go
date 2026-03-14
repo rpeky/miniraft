@@ -4,15 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
+	"net"
 	"os"
 	"slices"
 	"strings"
-	"time"
-
-	"log"
-	"net"
 	"sync"
+	"time"
 )
 
 /* --------------- Find file and consume data --------------------*/
@@ -82,7 +81,6 @@ func (message *RaftMessage) MarshalJson() (result []byte, err error) {
 	result, err = json.Marshal(message.Message)
 	return
 }
-
 func (message *RaftMessage) UnmarshalJSON(b []byte) (msg MessageType, err error) {
 	var clientMap map[string]string
 	err = json.Unmarshal(b, &clientMap)
@@ -98,160 +96,222 @@ func (message *RaftMessage) UnmarshalJSON(b []byte) (msg MessageType, err error)
 	if err == nil && aer.LeaderId != "" {
 		msg = AppendEntriesRequestMessage
 		message.Message = aer
-		return
-	}
-	if _, ok := err.(*json.UnmarshalTypeError); err != nil && !ok {
-		return
+		return msg, nil
 	}
 
-	aeres := &AppendEntriesResponse{}
-	if err = json.Unmarshal(b, aeres); err != nil {
-		return
+	if _, ok := err.(*json.UnmarshalTypeError); err != nil && !ok {
+		return 0, err
 	}
-	if aeres.Term > 0 {
-		msg = AppendEntriesResponseMessage
+
+	var raw map[string]json.RawMessage
+	err = json.Unmarshal(b, &raw)
+	if err != nil {
+		return 0, err
+	}
+
+	if _, ok := raw["Success"]; ok {
+		aeres := &AppendEntriesResponse{}
+		if err = json.Unmarshal(b, aeres); err != nil {
+			return 0, err
+		}
 		message.Message = aeres
-		return
+		return AppendEntriesResponseMessage, nil
 	}
 
 	rvr := &RequestVoteRequest{}
-	if err = json.Unmarshal(b, rvr); err != nil {
-		return
-	}
-	if rvr.Term > 0 {
-		msg = RequestVoteRequestMessage
+	if err = json.Unmarshal(b, rvr); err == nil && rvr.CandidateName != "" {
 		message.Message = rvr
-		return
+		return RequestVoteRequestMessage, nil
 	}
 
-	rvres := &RequestVoteResponse{}
-	if err = json.Unmarshal(b, rvres); err != nil {
-		return
+	if _, ok := err.(*json.UnmarshalTypeError); err != nil && !ok {
+		return 0, err
 	}
-	if rvres.Term > 0 {
-		msg = RequestVoteResponseMessage
+
+	if _, ok := raw["VoteGranted"]; ok {
+		rvres := &RequestVoteResponse{}
+		if err = json.Unmarshal(b, rvres); err != nil {
+			return 0, err
+		}
 		message.Message = rvres
+		return RequestVoteResponseMessage, nil
 	}
-	return
+
+	return 0, fmt.Errorf("unknown message type")
+	/*
+		aeres := &AppendEntriesResponse{}
+		if err = json.Unmarshal(b, aeres); err != nil {
+			return
+		}
+		if aeres.Term > 0 {
+			msg = AppendEntriesResponseMessage
+			message.Message = aeres
+			return
+		}
+		rvr := &RequestVoteRequest{}
+		if err = json.Unmarshal(b, rvr); err != nil {
+			return
+		}
+		if rvr.Term > 0 {
+			msg = RequestVoteRequestMessage
+			message.Message = rvr
+			return
+		}
+		rvres := &RequestVoteResponse{}
+		if err = json.Unmarshal(b, rvres); err != nil {
+			return
+		}
+		if rvres.Term > 0 {
+			msg = RequestVoteResponseMessage
+			message.Message = rvres
+		}
+	*/
 }
 
 func DropStaleResponse() {
+	// TODO
 }
 
 // Send messages to other servers only
 func (sm *ServerSM) Send(response any, target string) {
+	if sm.conn == nil {
+		return
+	}
+
 	rm := RaftMessage{Message: response}
-	data, _ := rm.MarshalJson()
+	data, err := rm.MarshalJson()
+	if err != nil {
+		log.Printf("marshal json error :%v", err)
+		return
+	}
+
+	if len(data) >= 1400 {
+		log.Printf("message too large: %d bytes", len(data))
+		return
+	}
 
 	udpAddress, err := net.ResolveUDPAddr("udp", target)
 	if err != nil {
 		return
 	}
 
-	conn, err := net.DialUDP("udp", nil, udpAddress)
+	_, err = sm.conn.WriteToUDP(data, udpAddress)
 	if err != nil {
+		log.Printf("udp write/send error :%v", err)
 		return
 	}
-	defer conn.Close()
-	conn.Write(data)
 }
 
 // Recieve messages from client / other servers
 func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
+	sm.mu.Lock()
+	if sm.state == Failed {
+		sm.mu.Unlock()
+		return
+	}
+	sm.mu.Unlock()
+
 	var rm RaftMessage
-	msgType, _ := rm.UnmarshalJSON(data)
+	msgType, umjErr := rm.UnmarshalJSON(data)
+	if umjErr != nil {
+		log.Printf("iUnmarshallJson error: %v", umjErr)
+		return
+	}
+	log.Printf("[%s] RECV from=%s msgType=%d raw=%s", sm.identity, senderAddress.String(), msgType, string(data))
 
 	switch msgType {
 	case ClientCommandMessage:
-		switch sm.state {
-		case Leader: // if leader, append to logs and alert all clients about this log
-			sm.mu.Lock()
-			newMessage := LogEntry{ // create log entry
-				Index:       len(sm.pstate.log) + 1,
-				Term:        sm.pstate.currentTerm,
-				CommandName: string(data),
-			}
+		sm.handleClientCommand(data)
 
-			// append to own entry
-			sm.pstate.log = append(sm.pstate.log, newMessage)
-			sm.mu.Unlock()
-
-			// Get data from current sm
-			sm.mu.Lock()
-			logs := sm.pstate.log
-			currentTerm := sm.pstate.currentTerm
-			commitIndex := sm.vstate.commitIndex
-			sm.mu.Unlock()
-
-			for _, peer := range sm.peers {
-				nextIndex := sm.lstate.nextIndex[peer]
-
-				if len(logs) >= nextIndex {
-					prevLogIndex := nextIndex - 1
-					prevLogTerm := 0
-					if prevLogIndex > 0 {
-						prevLogTerm = logs[prevLogIndex-1].Term
-					}
-
-					// Slice updated entries
-					entriesToSend := make([]LogEntry, len(logs[nextIndex-1:]))
-					copy(entriesToSend, logs[nextIndex-1:])
-
-					// Create Request
-					request := AppendEntriesRequest{
-						Term:         currentTerm,
-						LeaderId:     sm.identity,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						LogEntries:   entriesToSend,
-						LeaderCommit: commitIndex,
-					}
-
-					sm.Send(request, peer)
-				}
-
-			}
-		case Candidate: // either buffer these commands and process them after the election concludes, or drop them
-			DropMessage()
-		default: // if not leader, dont append anything and forward it to the leader (for both follower and failed)
-			sm.mu.Lock()
-			leaderID := sm.leaderID
-			sm.mu.Unlock()
-
-			if leaderID != "" {
-				leaderAddress, err := net.ResolveUDPAddr("udp", sm.leaderID)
-				if err != nil {
-					log.Fatalf("Failed to resolve: %v", err)
-				}
-
-				conn, _ := net.DialUDP("udp", nil, leaderAddress)
-				defer conn.Close()
-				conn.Write(data)
-			} else {
-				fmt.Println("Command received but leader is unknown so we will drop the message.")
-				DropMessage()
-			}
-		}
 	case AppendEntriesRequestMessage:
-		req := rm.Message.(*AppendEntriesRequest)
+		req, ok := rm.Message.(*AppendEntriesRequest)
+		if !ok || req == nil {
+			return
+		}
 		response := sm.HandleAppendEntriesRequest(req)
 		sm.Send(response, senderAddress.String())
+
 	case AppendEntriesResponseMessage:
-		resp := rm.Message.(*AppendEntriesResponse)
-		sm.HandleAppendEntriesResponse(resp)
+		resp, ok := rm.Message.(*AppendEntriesResponse)
+		if !ok || resp == nil {
+			return
+		}
+		sm.HandleAppendEntriesResponse(resp, senderAddress.String())
+
 	case RequestVoteRequestMessage:
-		break
+		req, ok := rm.Message.(*RequestVoteRequest)
+		if !ok || req == nil {
+			return
+		}
+		response := sm.HandleRequestVoteRequest(*req)
+		sm.Send(response, senderAddress.String())
+
 	case RequestVoteResponseMessage:
-		break
+		resp, ok := rm.Message.(*RequestVoteResponse)
+		if !ok || resp == nil {
+			return
+		}
+		sm.HandleRequestVoteResponse(resp, senderAddress.String())
+
 	default:
 		break
 	}
 }
 
+func extractCommandJson(data []byte) (string, error) {
+	var cmd map[string]string
+	if err := json.Unmarshal(data, &cmd); err != nil {
+		return "", err
+	}
+	return cmd["Command"], nil
+}
+
+// gonna refactor this bit from Receive
+func (sm *ServerSM) handleClientCommand(data []byte) {
+	sm.mu.Lock()
+
+	switch sm.state {
+	// if leader, append to logs and alert all clients about this log
+	case Leader:
+		cmd, _ := extractCommandJson(data)
+		newLogEntry := LogEntry{ // create log entry
+			Index:       len(sm.pstate.log) + 1,
+			Term:        sm.pstate.currentTerm,
+			CommandName: cmd,
+		}
+
+		// append to own entry
+		sm.pstate.log = append(sm.pstate.log, newLogEntry)
+		peers := append([]string(nil), sm.peers...)
+		sm.mu.Unlock()
+
+		for _, peer := range peers {
+			go sm.AppendEntries(peer)
+
+		}
+
+	case Candidate: // either buffer these commands and process them after the election concludes, or drop them
+		sm.mu.Unlock()
+		DropMessage()
+
+	case Follower:
+		leaderID := sm.leaderID
+		sm.mu.Unlock()
+		if leaderID != "" {
+			sm.Send(json.RawMessage(data), leaderID)
+		}
+
+	default:
+		sm.mu.Unlock()
+	}
+}
+
 func DuplicateMessage() {
+	//TODO
 }
 
 func DropMessage() {
+	//TODO
 }
 
 /* --------------- Raft operations --------------------*/
@@ -271,12 +331,48 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
-// used by leader to replicate log entries
+// used by leader to replicate log entries using leder data
 // also meant to be a heartbeat
-func AppendEntries() {
+func (sm *ServerSM) AppendEntries(peer string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// leader logs is the truth, skip
+	if sm.state != Leader {
+		return
+	}
+
+	nextIdx := sm.lstate.nextIndex[peer]
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := 0
+	if prevLogIndex > 0 {
+		prevLogTerm = sm.pstate.log[prevLogIndex-1].Term
+	}
+
+	var entries []LogEntry
+	if nextIdx <= len(sm.pstate.log) {
+		// update logs
+		entries = []LogEntry{
+			sm.pstate.log[nextIdx-1],
+		}
+	}
+
+	req := AppendEntriesRequest{
+		Term:         sm.pstate.currentTerm,
+		LeaderId:     sm.identity,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		LogEntries:   entries,
+		LeaderCommit: sm.vstate.commitIndex,
+	}
+
+	go sm.Send(req, peer)
+
 }
 
 func ClientRequest() {
+	//TODO
+	//put inside receive
 }
 
 func (sm *ServerSM) checkTerm(index int) int {
@@ -297,16 +393,32 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 	}
 
 	// mismatch term 5.1
+	// return fail if smaller
 	if RequestData.Term < sm.pstate.currentTerm {
 		return resp
 	}
+
+	// update if larger
+	if RequestData.Term > sm.pstate.currentTerm {
+		sm.UpdateTerm(RequestData.Term)
+	}
+
+	resp.Term = sm.pstate.currentTerm
+
+	// term is valid, update values
+	// transition candidate to follower on leader contect, reset timer
+	sm.state = Follower
+	sm.leaderID = RequestData.LeaderId
+	sm.latestHeartbeat = time.Now()
+	resp.Term = sm.pstate.currentTerm
 
 	// log does not have prevLogIndex 5.2
 	if RequestData.PrevLogIndex > len(sm.pstate.log) {
 		return resp
 	}
 
-	if RequestData.PrevLogIndex > 0 && sm.checkTerm(RequestData.PrevLogIndex) != RequestData.PrevLogTerm {
+	// check if prev log terms match
+	if RequestData.PrevLogIndex > 0 && sm.pstate.log[RequestData.PrevLogIndex-1].Term != RequestData.PrevLogTerm {
 		return resp
 	}
 
@@ -338,35 +450,78 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 		break
 	}
 
-	// AppendEntries RPC receiver step 5
+	// AppendEntries RPC receiver step 5 -> fix commmit value
 	if RequestData.LeaderCommit > sm.vstate.commitIndex {
 		// set commit index to the min
 		sm.vstate.commitIndex = min(RequestData.LeaderCommit, len(sm.pstate.log))
+		sm.ApplyCommitedEntries()
 	}
 
 	// change to true to return
 	resp.Success = true
-
 	return resp
 }
 
+func (sm *ServerSM) ApplyCommitedEntries() {
+	// it still feels weird that for is overloaded with while and extracting range looping lol
+	for sm.vstate.lastApplied < sm.vstate.commitIndex {
+		sm.vstate.lastApplied++
+		entry := sm.pstate.log[sm.vstate.lastApplied-1]
+		// check if there is an error
+		if err := sm.formatLogging(entry); err != nil {
+			log.Printf("ApplyCommitedEntries log write error: %v", err)
+		}
+	}
+}
 
-func (sm *ServerSM) HandleAppendEntriesResponse(resp AppendEntriesResponse) {
+func (sm *ServerSM) HandleAppendEntriesResponse(resp *AppendEntriesResponse, follower string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.state != Leader {
+		return
+	}
+
 	// stale message
 	if sm.pstate.currentTerm > resp.Term {
 		return
 	}
 
-	// check response, update if smaller
+	// not up to date, update logs
 	if sm.pstate.currentTerm < resp.Term {
-		sm.pstate.currentTerm = resp.Term
-
-		// demote to follower if term is out of date
-		if sm.state == Candidate || sm.state == Leader {
-			sm.state = Follower
-		}
+		sm.UpdateTerm(resp.Term)
+		return
 	}
 
+	if resp.Success {
+		// check if leader is behind
+		if sm.lstate.nextIndex[follower] <= len(sm.pstate.log) {
+			sm.lstate.matchIndex[follower] = sm.lstate.nextIndex[follower]
+			sm.lstate.nextIndex[follower]++
+		}
+		sm.AdvanceCommitIndex()
+		sm.ApplyCommitedEntries()
+		return
+	}
+
+	sm.lstate.nextIndex[follower] = max(1, sm.lstate.nextIndex[follower]-1)
+	go sm.AppendEntries(follower)
+}
+
+// leader needs to send heartbeat to retain leadership or an election will be called
+func (sm *ServerSM) HeartbeatTick() {
+	sm.mu.Lock()
+	if sm.state != Leader || sm.state == Failed {
+		sm.mu.Unlock()
+		return
+	}
+
+	peers := append([]string(nil), sm.peers...)
+	sm.mu.Unlock()
+
+	for _, peer := range peers {
+		go sm.AppendEntries(peer)
+	}
 }
 
 /* --------------- Voting mechanism --------------------*/
@@ -394,6 +549,9 @@ func (sm *ServerSM) SetElectionTimeout() {
 }
 
 func (sm *ServerSM) Timeout() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	if sm.state == Failed || sm.state == Leader {
 		return
 	}
@@ -404,21 +562,86 @@ func (sm *ServerSM) Timeout() {
 		return
 	}
 
+	// debug
+	log.Printf("[%s] TIMEOUT currentTerm=%d state=%d -> start election", sm.identity, sm.pstate.currentTerm, sm.state)
+
 	// expired
+	// transition to candndate, increment term, reset vote tracking
+	// vote for yourself, reset the VolatileCandidate states
+	// update self voting
+	sm.leaderID = ""
+	sm.state = Candidate
+	sm.pstate.currentTerm++
+	sm.pstate.votedFor = sm.identity
+
+	sm.cstate.initialiseVCState(sm.pstate.currentTerm)
+	sm.cstate.votesResponded[sm.identity] = true
+	sm.cstate.votesGranted[sm.identity] = true
+
+	// debug
+	log.Printf("[%s] BECAME CANDIDATE term=%d votedFor=%s lastIdx=%d lastTerm=%d",
+		sm.identity, sm.pstate.currentTerm, sm.pstate.votedFor, sm.lastLogIndex(), sm.lastLogTerm())
+
+	// use the helper for a random time
+	sm.SetElectionTimeout()
+
+	currentTerm := sm.pstate.currentTerm
+	lastIdx := sm.lastLogIndex()
+	lastTerm := sm.lastLogTerm()
+	peers := append([]string(nil), sm.peers...)
+
+	go func(term int, lidx int, lterm int, peers []string) {
+		req := RequestVoteRequest{
+			term,
+			lidx,
+			lterm,
+			sm.identity,
+		}
+
+		for _, peer := range peers {
+			// debug
+			log.Printf("[%s] SEND RequestVote to=%s term=%d lastIdx=%d lastTerm=%d",
+				sm.identity, peer, term, lidx, lterm)
+			sm.Send(req, peer)
+		}
+	}(currentTerm, lastIdx, lastTerm, peers)
+}
+
+func (sm *ServerSM) UpdateTerm(newTerm int) {
+	//TODO
+	// RPC update currentTerm reset voted for convert to follower
+	if newTerm <= sm.pstate.currentTerm {
+		return
+	}
+
+	// reset to follower, nuke states for overwrite
+	sm.pstate.currentTerm = newTerm
+	sm.pstate.votedFor = ""
+	sm.state = Follower
+	sm.leaderID = ""
+
+	sm.cstate = VolatileStateCandidate{}
+
+	sm.lstate = VolatileStateLeader{
+		make(map[string]int),
+		make(map[string]int),
+	}
 
 }
 
-func UpdateTerm() {
-
-}
-
-func checkLog(lastIdx int, lastTerm int, rlog LogEntry) bool {
-	evalIndex := lastIdx >= rlog.Index
-	evalTerm := lastTerm >= rlog.Term
-	return evalIndex && evalTerm
+// compare against
+func checkLog(reqLogIdx int, reqLogTerm int, lastIdx int, lastTerm int) bool {
+	// check terms, return if the req term is larger
+	if reqLogTerm != lastTerm {
+		return reqLogTerm > lastTerm
+	}
+	// check last idx
+	return reqLogIdx >= lastIdx
 }
 
 func RequestVote() {
+	//TODO
+	// send to peers not already responded in current election
 
 }
 
@@ -428,9 +651,28 @@ func (sm *ServerSM) BecomeLeader() {
 	}
 
 	sm.state = Leader
+	sm.leaderID = sm.identity
+	sm.lstate.initialiseVVState(sm.lastLogIndex(), sm.peers)
+	sm.cstate = VolatileStateCandidate{}
+
+	peers := append([]string(nil), sm.peers...)
+	go func(peers []string) {
+		for _, peer := range peers {
+			// tell peers to append entries
+			sm.AppendEntries(peer)
+		}
+	}(peers)
 }
 
 func (sm *ServerSM) HandleRequestVoteRequest(req RequestVoteRequest) RequestVoteResponse {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// debug
+	log.Printf("[%s] RECV RequestVote from=%s reqTerm=%d reqLastIdx=%d reqLastTerm=%d myTerm=%d myLastIdx=%d myLastTerm=%d votedFor=%s",
+		sm.identity, req.CandidateName, req.Term, req.LastLogIndex, req.LastLogTerm,
+		sm.pstate.currentTerm, sm.lastLogIndex(), sm.lastLogTerm(), sm.pstate.votedFor)
+
 	resp := RequestVoteResponse{
 		sm.pstate.currentTerm,
 		false,
@@ -441,15 +683,90 @@ func (sm *ServerSM) HandleRequestVoteRequest(req RequestVoteRequest) RequestVote
 		return resp
 	}
 
-	if (sm.pstate.votedFor == "" || sm.pstate.votedFor == req.CandidateName) && checkLog(req.LastLogIndex, req.LastLogTerm, sm.pstate.log[len(sm.pstate.log)-1]) {
+	// update logs if the request if further ahead
+	if req.Term > sm.pstate.currentTerm {
+		sm.UpdateTerm(req.Term)
+	}
+
+	resp.Term = sm.pstate.currentTerm
+
+	// vote for the candidate if the request is valid
+	if (sm.pstate.votedFor == "" || sm.pstate.votedFor == req.CandidateName) && checkLog(req.LastLogIndex, req.LastLogTerm, sm.lastLogIndex(), sm.lastLogTerm()) {
+		sm.pstate.votedFor = req.CandidateName
+		sm.latestHeartbeat = time.Now()
 		resp.VoteGranted = true
-		return resp
 	}
 
 	return resp
 }
 
-func HandleRequestVoteResponse() {
+func (sm *ServerSM) HandleRequestVoteResponse(resp *RequestVoteResponse, voter string) {
+	// check votes responded and votes granded
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.state != Candidate {
+		return
+	}
+
+	if resp.Term < sm.pstate.currentTerm {
+		return
+	}
+
+	if resp.Term > sm.pstate.currentTerm {
+		sm.UpdateTerm(resp.Term)
+		return
+	}
+
+	// stale message
+	if sm.cstate.electerm != sm.pstate.currentTerm {
+		return
+	}
+
+	// already voted
+	if sm.cstate.votesResponded[voter] {
+		return
+	}
+
+	sm.cstate.votesResponded[voter] = true
+	if resp.VoteGranted {
+		sm.cstate.votesGranted[voter] = true
+	}
+
+	if len(sm.cstate.votesGranted) >= majority(len(sm.peers)+1) {
+		sm.BecomeLeader()
+	}
+
+}
+
+func (sm *ServerSM) AdvanceCommitIndex() {
+	// only Leader can modify the value
+	if sm.state != Leader {
+		return
+	}
+
+	lastIdx := sm.lastLogIndex()
+	clustersize := len(sm.peers) + 1
+
+	for n := lastIdx; n > sm.vstate.commitIndex; n-- {
+		if sm.pstate.log[n-1].Term != sm.pstate.currentTerm {
+			continue
+		}
+
+		// exclude self
+		track := 1
+		for _, peer := range sm.peers {
+			if sm.lstate.matchIndex[peer] >= n {
+				track++
+			}
+		}
+
+		if track >= majority(clustersize) {
+			sm.vstate.commitIndex = n
+			return
+		}
+	}
+
 }
 
 /* --------------- State Machine Mechanisms --------------------*/
@@ -475,6 +792,16 @@ type VolatileState struct {
 	lastApplied int
 }
 
+type VolatileStateCandidate struct {
+	electerm       int
+	votesResponded map[string]bool
+	votesGranted   map[string]bool
+	/*
+		voterLastLogIndex map[string]int
+		voterLastLogTerm  map[string]int
+	*/
+}
+
 type VolatileStateLeader struct {
 	nextIndex  map[string]int
 	matchIndex map[string]int
@@ -485,14 +812,23 @@ func (p *PersistentState) initialisePState() {
 	p.votedFor = ""
 }
 
+func (vc *VolatileStateCandidate) initialiseVCState(term int) {
+	vc.electerm = term
+	vc.votesResponded = make(map[string]bool)
+	vc.votesGranted = make(map[string]bool)
+
+}
+
 func (v *VolatileState) initialiseVState() {
 	v.commitIndex = 0
 	v.lastApplied = 0
 }
 
 func (vl *VolatileStateLeader) initialiseVVState(lastLog int, peers []string) {
-	vl.nextIndex = make(map[string]int)
+	// poll everyone for match index
 	vl.matchIndex = make(map[string]int)
+	// set the new valyue for
+	vl.nextIndex = make(map[string]int)
 
 	for _, peer := range peers {
 		vl.nextIndex[peer] = lastLog + 1
@@ -505,13 +841,18 @@ type ServerSM struct {
 	// server role
 	state ServerState
 
+	// store UDP listening socket
+	conn *net.UDPConn
+
 	// state management stuff
 	identity string
 	leaderID string
 	peers    []string
 
+	// states for server ops, candidate, leader tracking
 	pstate PersistentState
 	vstate VolatileState
+	cstate VolatileStateCandidate
 	lstate VolatileStateLeader
 
 	// voting mechanism
@@ -580,17 +921,57 @@ func initialiseSM(identity string, hostlist []string) (*ServerSM, error) {
 	return s, nil
 }
 
-func (sm *ServerSM) printLog() {
-	fmt.Println("plaeholder log test")
-	sample := LogEntry{
-		Index:       0,
-		Term:        1,
-		CommandName: "test",
+func min(a int, b int) int {
+	if a < b {
+		return a
 	}
-	sm.formatLogging(sample)
+	return b
+}
+
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func majority(n int) int {
+	return n/2 + 1
+}
+
+func (sm *ServerSM) lastLogIndex() int {
+	return len(sm.pstate.log)
+}
+
+func (sm *ServerSM) lastLogTerm() int {
+	if len(sm.pstate.log) == 0 {
+		return 0
+	}
+	return sm.pstate.log[len(sm.pstate.log)-1].Term
+}
+
+func (sm *ServerSM) printLog() {
+	/*
+		fmt.Println("plaeholder log test")
+		sample := LogEntry{
+			Index:       0,
+			Term:        1,
+			CommandName: "test",
+		}
+		sm.formatLogging(sample)
+	*/
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for _, entry := range sm.pstate.log {
+		fmt.Printf("%d,%d,%s\n", entry.Term, entry.Index, entry.CommandName)
+	}
 }
 
 func (sm *ServerSM) printStates() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	fmt.Printf("identity: %s\n", sm.identity)
 	fmt.Printf("state: %d\n", sm.state)
 	fmt.Println("\t0 - Follower")
@@ -604,9 +985,20 @@ func (sm *ServerSM) printStates() {
 	fmt.Printf("commit index: %d\n", sm.vstate.commitIndex)
 	fmt.Printf("last applied: %d\n", sm.vstate.lastApplied)
 	fmt.Printf("log size: %d\n", len(sm.pstate.log))
+	fmt.Printf("nextIndex %v\n", sm.lstate.nextIndex)
+	fmt.Printf("matchIndex %v\n", sm.lstate.matchIndex)
 }
 
 /*--------------------State Transitions-------------------------*/
+func (sm *ServerSM) Restart() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.state = Follower
+	sm.leaderID = ""
+	sm.timeoutDuration = RandomTimeoutValue()
+	sm.latestHeartbeat = time.Now()
+}
 
 /*--------------------main-------------------------*/
 func main() {
@@ -650,6 +1042,9 @@ func main() {
 			log.Fatalf("Failed to listen: %v", err)
 		}
 
+		// store the UDP socket
+		server.conn = listener
+
 		for {
 			buf := make([]byte, 65536)
 
@@ -661,6 +1056,24 @@ func main() {
 
 			// Use another goroutine in case there is a slow request, so we can continue listening for messages
 			go server.Receive(buf[:n], remoteAddress)
+		}
+	}()
+
+	// election timer main loop
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			server.Timeout()
+		}
+	}()
+
+	// leader heartbeat
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			server.HeartbeatTick()
 		}
 	}()
 
@@ -691,12 +1104,14 @@ func main() {
 
 		case "resume":
 			// default behaviour is to be a follower, reset leader, wait to vote
-			server.state = Follower
-			server.leaderID = ""
+			server.Restart()
 			fmt.Printf("server %s resuming, wait for next vote to do stuff\n", server.identity)
 
 		case "suspend":
+			server.mu.Lock()
 			server.state = Failed
+			server.mu.Unlock()
+
 			fmt.Printf("suspended server %s\n", server.identity)
 
 		case "q":
