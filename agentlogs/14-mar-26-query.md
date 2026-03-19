@@ -355,3 +355,6 @@ space it out better, seperate them so that the tikz borders do not overlap
 
 \end{tikzpicture}
 \end{document}
+
+
+-> ended up not using it, i don't really trust whether it actually broke down the code into state machine, i'll just draw it manually and compare agains the pdf

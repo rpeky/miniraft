@@ -921,20 +921,6 @@ func initialiseSM(identity string, hostlist []string) (*ServerSM, error) {
 	return s, nil
 }
 
-func min(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func majority(n int) int {
 	return n/2 + 1
 }
@@ -1122,5 +1108,4 @@ func main() {
 			fmt.Printf("Command not understood: %s\n", cmd)
 		}
 	}
-
 }
