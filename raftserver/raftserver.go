@@ -44,7 +44,7 @@ func validateServer(identity string, hosts []string) bool {
 func constructLogFile(id string) (*os.File, error) {
 	parsedName := strings.ReplaceAll(id, ":", "-")
 	fileName := "server-" + parsedName + ".log"
-	logFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
+	logFile, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return nil, err
 	}
