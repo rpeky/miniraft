@@ -44,7 +44,7 @@ func validateServer(identity string, hosts []string) bool {
 func constructLogFile(id string) (*os.File, error) {
 	parsedName := strings.ReplaceAll(id, ":", "-")
 	fileName := "server-" + parsedName + ".log"
-	logFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
+	logFile, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -921,20 +921,6 @@ func initialiseSM(identity string, hostlist []string) (*ServerSM, error) {
 	return s, nil
 }
 
-func min(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func majority(n int) int {
 	return n/2 + 1
 }
@@ -1122,5 +1108,4 @@ func main() {
 			fmt.Printf("Command not understood: %s\n", cmd)
 		}
 	}
-
 }
