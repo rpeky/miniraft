@@ -15,7 +15,7 @@ type ClientCommand struct {
 }
 
 // Reference: https://www.geeksforgeeks.org/go-language/check-if-the-rune-is-a-unicode-punctuation-character-or-not-in-golang/
-func MessageValidity(s string) bool {
+func IsMessageValid(s string) bool {
 	for _, r := range s {
 		if unicode.IsPunct(r) || unicode.IsSpace(r) {
 			return false
@@ -72,7 +72,7 @@ func main() {
 		}
 
 		// check for command validity -- no punctuation / spaces for all commands
-		if !MessageValidity(cmd) {
+		if !IsMessageValid(cmd) {
 			fmt.Println("Error: Only letters and digits are permitted (no spaces or punctuation).")
 			continue
 		}
