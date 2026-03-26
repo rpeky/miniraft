@@ -202,7 +202,7 @@ func (sm *ServerSM) Send(response any, target string) {
 	}
 }
 
-// Recieve messages from client / other servers
+// Receive messages from client / other servers
 func (sm *ServerSM) Receive(data []byte, senderAddress *net.UDPAddr) {
 	sm.mu.Lock()
 	if sm.state == Failed {
@@ -1047,21 +1047,30 @@ func main() {
 	defer server.logFile.Close()
 
 	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
+	// refactored to pull this portion out, just leave the udp listener part inside
+	addr, err := net.ResolveUDPAddr("udp", server.identity)
+	if err != nil {
+		log.Fatalf("Failed to resolve: %v", err)
+	}
+
+	listener, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	// store the UDP socket
+	server.conn = listener
+
+	// pass the udp packet to a channel to consume
+	type packet struct {
+		data    []byte
+		remoteA *net.UDPAddr
+	}
+	netC := make(chan packet, 64)
+
 	// Reference: miniraft.pdf
+	// go routine to listen on udp
 	go func() {
-		addr, err := net.ResolveUDPAddr("udp", server.identity)
-		if err != nil {
-			log.Fatalf("Failed to resolve: %v", err)
-		}
-
-		listener, err := net.ListenUDP("udp", addr)
-		if err != nil {
-			log.Fatalf("Failed to listen: %v", err)
-		}
-
-		// store the UDP socket
-		server.conn = listener
-
 		for {
 			buf := make([]byte, 65536)
 
@@ -1071,72 +1080,93 @@ func main() {
 				continue
 			}
 
-			// Use another goroutine in case there is a slow request, so we can continue listening for messages
-			go server.Receive(buf[:n], remoteAddress)
+			msg := make([]byte, n)
+			copy(msg, buf[:n])
+			netC <- packet{
+				msg,
+				remoteAddress,
+			}
 		}
 	}()
 
-	// election timer main loop
+	// make a channel for stdin
+	stdC := make(chan string, 16)
+	// go routine to read stdin
 	go func() {
-		ticker := time.NewTicker(25 * time.Millisecond)
-		defer ticker.Stop()
-		for range ticker.C {
-			server.Timeout()
+		// loop and wait for user inputs (Reference: minichord.pdf)
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			cmd, err := reader.ReadString('\n')
+			// ngl im not sure how stdin will error out but to
+			// be safe
+			if err != nil {
+				close(stdC)
+				fmt.Println(err)
+				return
+			}
+			stdC <- strings.TrimSpace(cmd)
 		}
 	}()
+
+	// combine these go routines into one, prevent funny bugs
+	// election timer main loop
+	electionTicker := time.NewTicker(25 * time.Millisecond)
+	defer electionTicker.Stop()
 
 	// leader heartbeat
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for range ticker.C {
-			server.HeartbeatTick()
-		}
-	}()
-
-	// loop and wait for user inputs (Reference: minichord.pdf)
-	reader := bufio.NewReader(os.Stdin)
+	heartbeatTicker := time.NewTicker(50 * time.Millisecond)
+	defer heartbeatTicker.Stop()
 
 	for {
-		cmd, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println(err)
-			break
-		}
-		cmd = strings.TrimSpace(cmd)
+		// its a bunch of channels, gonna try w select
+		// dequeue the channels and consume
+		select {
+		case pack := <-netC:
+			server.Receive(pack.data, pack.remoteA)
 
-		// guard input
-		tok := strings.Fields(cmd)
-		if len(tok) == 0 {
-			continue
-		}
+		case <-electionTicker.C:
+			server.Timeout()
 
-		switch tok[0] {
+		case <-heartbeatTicker.C:
+			server.HeartbeatTick()
 
-		case "log":
-			server.printLog()
+		case cmd, ok := <-stdC:
+			if !ok {
+				return
+			}
+			// guard input
+			tok := strings.Fields(cmd)
+			if len(tok) == 0 {
+				continue
+			}
 
-		case "print":
-			server.printStates()
+			switch tok[0] {
 
-		case "resume":
-			// default behaviour is to be a follower, reset leader, wait to vote
-			server.Restart()
-			fmt.Printf("server %s resuming, wait for next vote to do stuff\n", server.identity)
+			case "log":
+				server.printLog()
 
-		case "suspend":
-			server.mu.Lock()
-			server.state = Failed
-			server.mu.Unlock()
+			case "print":
+				server.printStates()
 
-			fmt.Printf("suspended server %s\n", server.identity)
+			case "resume":
+				// default behaviour is to be a follower, reset leader, wait to vote
+				server.Restart()
+				fmt.Printf("server %s resuming, wait for next vote to do stuff\n", server.identity)
 
-		case "q":
-			server.printStates()
-			return
+			case "suspend":
+				server.mu.Lock()
+				server.state = Failed
+				server.mu.Unlock()
 
-		default:
-			fmt.Printf("Command not understood: %s\n", cmd)
+				fmt.Printf("suspended server %s\n", server.identity)
+
+			case "q":
+				server.printStates()
+				return
+
+			default:
+				fmt.Printf("Command not understood: %s\n", cmd)
+			}
 		}
 	}
 }
