@@ -286,20 +286,23 @@ func (sm *ServerSM) handleClientCommand(data []byte) {
 		sm.mu.Unlock()
 
 		for _, peer := range peers {
-			go sm.AppendEntries(peer)
+			// removed goroutine use
+			sm.AppendEntries(peer)
 
 		}
 
-	case Candidate: // either buffer these commands and process them after the election concludes, or drop them
+	case Candidate: // buffer these commands and process them after the election concludes
+		sm.commandBuffer = append(sm.commandBuffer, data)
 		sm.mu.Unlock()
-		DropMessage()
 
 	case Follower:
 		leaderID := sm.leaderID
-		sm.mu.Unlock()
 		if leaderID != "" {
 			sm.Send(json.RawMessage(data), leaderID)
+		} else { // in case no leader is known, somehow
+			sm.commandBuffer = append(sm.commandBuffer, data)
 		}
+		sm.mu.Unlock()
 
 	default:
 		sm.mu.Unlock()
@@ -411,6 +414,14 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 	sm.leaderID = RequestData.LeaderId
 	sm.latestHeartbeat = time.Now()
 	resp.Term = sm.pstate.currentTerm
+
+	// send any buffered commands for the new leader to deal with
+	if len(sm.commandBuffer) > 0 {
+		for _, data := range sm.commandBuffer {
+			sm.Send(json.RawMessage(data), sm.leaderID)
+		}
+		sm.commandBuffer = nil
+	}
 
 	// log does not have prevLogIndex 5.2
 	if RequestData.PrevLogIndex > len(sm.pstate.log) {
@@ -541,6 +552,7 @@ type RequestVoteResponse struct {
 // somewhere between 150-300ms fixed interval
 func RandomTimeoutValue() time.Duration {
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	//return time.Duration(300) * time.Millisecond -- for testing two candidates
 }
 
 func (sm *ServerSM) SetElectionTimeout() {
@@ -654,6 +666,22 @@ func (sm *ServerSM) BecomeLeader() {
 	sm.leaderID = sm.identity
 	sm.lstate.initialiseVVState(sm.lastLogIndex(), sm.peers)
 	sm.cstate = VolatileStateCandidate{}
+
+	// handle any buffered commands stored
+	for _, data := range sm.commandBuffer {
+		cmd, _ := extractCommandJson(data)
+		newLogEntry := LogEntry{ // create log entry
+			Index:       len(sm.pstate.log) + 1,
+			Term:        sm.pstate.currentTerm,
+			CommandName: cmd,
+		}
+
+		// append to own entry
+		sm.pstate.log = append(sm.pstate.log, newLogEntry)
+	}
+
+	// clear the buffer once all have been accounted for
+	sm.commandBuffer = nil
 
 	peers := append([]string(nil), sm.peers...)
 	go func(peers []string) {
@@ -860,6 +888,9 @@ type ServerSM struct {
 	latestHeartbeat time.Time
 
 	logFile *os.File
+
+	// buffered commands -- using list instead of channel to remove need to have a goroutine listening to channel (simplify logic!!)
+	commandBuffer [][]byte
 
 	// lock shared stuff
 	mu sync.Mutex
