@@ -52,7 +52,7 @@ func main() {
 	}
 
 	serverAddress := os.Args[1]
-	fmt.Printf("Started raft client targetting: %s", serverAddress)
+	fmt.Printf("Started raft client targetting: %s\n", serverAddress)
 
 	// loop and wait for user inputs (Reference: minichord.pdf)
 	reader := bufio.NewReader(os.Stdin)
