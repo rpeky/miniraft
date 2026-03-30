@@ -304,6 +304,14 @@ func (sm *ServerSM) handleClientCommand(data []byte) {
 		}
 		sm.mu.Unlock()
 
+	case Failed:
+		leaderID := sm.leaderID
+		if leaderID != "" {
+			sm.Send(json.RawMessage(data), leaderID)
+		} else { // in case no leader is known, somehow
+			sm.commandBuffer = append(sm.commandBuffer, data)
+		}
+		sm.mu.Unlock()
 	default:
 		sm.mu.Unlock()
 	}
@@ -410,7 +418,9 @@ func (sm *ServerSM) HandleAppendEntriesRequest(RequestData *AppendEntriesRequest
 
 	// term is valid, update values
 	// transition candidate to follower on leader contect, reset timer
-	sm.state = Follower
+	if sm.state != Failed {
+		sm.state = Follower
+	}
 	sm.leaderID = RequestData.LeaderId
 	sm.latestHeartbeat = time.Now()
 	resp.Term = sm.pstate.currentTerm
@@ -627,9 +637,12 @@ func (sm *ServerSM) UpdateTerm(newTerm int) {
 	}
 
 	// reset to follower, nuke states for overwrite
+	// maintain failed state if suspended
+	if sm.state != Failed {
+		sm.state = Follower
+	}
 	sm.pstate.currentTerm = newTerm
 	sm.pstate.votedFor = ""
-	sm.state = Follower
 	sm.leaderID = ""
 
 	sm.cstate = VolatileStateCandidate{}
